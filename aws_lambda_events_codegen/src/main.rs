@@ -2,8 +2,10 @@ extern crate go_to_rust;
 #[macro_use]
 extern crate quicli;
 extern crate codegen;
+extern crate regex;
 
 use quicli::prelude::*;
+use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::prelude::*;
@@ -17,7 +19,13 @@ struct ParsedEventFile {
     path: PathBuf,
     go: go_to_rust::GoCode,
     rust: go_to_rust::RustCode,
-    example_event: Option<String>,
+    example_events: Vec<ExampleEvent>,
+}
+
+#[derive(Debug)]
+struct ExampleEvent {
+    event_type: Option<String>,
+    contents: String,
 }
 
 /// Generate rust code for AWS lambda events sourced from `aws-go-sdk`
@@ -126,34 +134,58 @@ fn get_fuzzy_file_listing(dir_path: &Path) -> Result<HashMap<String, PathBuf>> {
     Ok(listing)
 }
 
-fn find_example_event(
+fn find_example_events(
     fuzzy_files: &HashMap<String, PathBuf>,
     service_name: &str,
     example_event_path: &Path,
-) -> Result<Option<String>> {
+) -> Result<Vec<ExampleEvent>> {
     let mut name_with_quirks = match service_name.as_ref() {
         "codepipeline_job" => "codepipline-event.json".to_string(),
         "firehose" => "kinesis-firehose-event.json".to_string(),
         service_name => format!("{}-event.json", service_name),
     };
     fuzz(&mut name_with_quirks);
-    trace!("Looking for example event: {}", service_name);
-    let file = match fuzzy_files.get(&name_with_quirks) {
-        None => {
-            info!("No example event for service: {}", service_name);
-            return Ok(None);
-        }
-        Some(file) => {
-            info!(
-                "Found example event for service {} at: {}",
-                service_name,
-                file.to_string_lossy()
-            );
-            example_event_path.join(&file)
-        }
-    };
+    trace!("Looking for example events: {}", service_name);
 
-    read_example_event(&file)
+    // Look first for a single example event for the service.
+    let mut files = Vec::new();
+    if let Some(file) = fuzzy_files.get(&name_with_quirks) {
+        files.push((None, file));
+    }
+
+    // Some services have multiple example events named <service>-event-<event_type>.json.
+    let mut pattern = format!("{}-event-(.+).json", service_name);
+    fuzz(&mut pattern);
+    let re = Regex::new(&pattern)?;
+    for (name, file) in fuzzy_files.iter() {
+        if let Some(captures) = re.captures(name) {
+            if let Some(event_type) = captures.get(1) {
+                files.push((Some(event_type.as_str()), file));
+            }
+        }
+    }
+
+    let mut events = Vec::new();
+    for (event_type, file) in files {
+        info!(
+            "Found example event for service {} at: {}",
+            service_name,
+            file.to_string_lossy()
+        );
+        let file = example_event_path.join(&file);
+        if let Some(contents) = read_example_event(&file)? {
+            events.push(ExampleEvent {
+                event_type: event_type.map(|s| s.into()),
+                contents,
+            });
+        }
+    }
+
+    if events.is_empty() {
+        info!("No example events for service: {}", service_name);
+    }
+
+    Ok(events)
 }
 
 fn read_example_event(test_fixture: &PathBuf) -> Result<Option<String>> {
@@ -165,31 +197,47 @@ fn read_example_event(test_fixture: &PathBuf) -> Result<Option<String>> {
     Ok(Some(contents))
 }
 
-fn write_fixture(
+fn write_fixtures(
     service_name: &str,
-    example_event: &String,
+    example_events: &Vec<ExampleEvent>,
     out_dir: &PathBuf,
     overwrite: &bool,
-) -> Result<PathBuf> {
-    let relative = PathBuf::from(format!("fixtures/example-{}-event.json", service_name));
-    // Write the example event to the output location.
-    let full = out_dir.join(relative.clone());
-    {
-        let parent = full.parent().expect("parent directory");
-        if !parent.exists() {
-            trace!("Creating fixture directory: {:?}", parent);
-            create_dir(&parent)?;
+) -> Result<Vec<PathBuf>> {
+    let mut relatives = Vec::new();
+    for example_event in example_events {
+        let relative = match &example_event.event_type {
+            // For backwards compatability.
+            None => PathBuf::from(format!("fixtures/example-{}-event.json", service_name)),
+            Some(event_type) => PathBuf::from(format!(
+                "fixtures/example-{}-{}-event.json",
+                service_name, event_type
+            )),
+        };
+        // Write the example event to the output location.
+        let full = out_dir.join(relative.clone());
+        {
+            let parent = full.parent().expect("parent directory");
+            if !parent.exists() {
+                trace!("Creating fixture directory: {:?}", parent);
+                create_dir(&parent)?;
+            }
         }
+        if overwrite_warning(&full, *overwrite).is_none() {
+            let mut f = File::create(full)?;
+            f.write_all(example_event.contents.as_bytes())?;
+            f.write_all("\n".as_bytes())?;
+        }
+
+        relatives.push(relative);
     }
-    if overwrite_warning(&full, *overwrite).is_none() {
-        let mut f = File::create(full)?;
-        f.write_all(example_event.as_bytes())?;
-        f.write_all("\n".as_bytes())?;
-    }
-    Ok(relative)
+
+    Ok(relatives)
 }
 
-fn generate_test_module(scope: &codegen::Scope, relative: &PathBuf) -> Result<codegen::Module> {
+fn generate_test_module(
+    scope: &codegen::Scope,
+    relatives: &Vec<PathBuf>,
+) -> Result<codegen::Module> {
     let mut toplevel_type = None;
     for item in scope.items() {
         match item {
@@ -202,35 +250,44 @@ fn generate_test_module(scope: &codegen::Scope, relative: &PathBuf) -> Result<co
             _ => continue,
         }
     }
-    let mut test_function = codegen::Function::new("example_event");
-    test_function.annotation(vec!["test"]);
-    // Include the fixture content.
-    test_function.line(format!(
-        r#"let data = include_bytes!("{}");"#,
-        relative.to_string_lossy(),
-    ));
-    // Deserialize.
-    test_function.line(format!(
-        r#"let parsed: {} = serde_json::from_slice(data).unwrap();"#,
-        toplevel_type.expect("top-level type defined"),
-    ));
-    // Serialize.
-    test_function.line(String::from(
-        r#"let output: String = serde_json::to_string(&parsed).unwrap();"#,
-    ));
-    // Deserialize.
-    test_function.line(format!(
-        r#"let reparsed: {} = serde_json::from_slice(output.as_bytes()).unwrap();"#,
-        toplevel_type.expect("top-level type defined"),
-    ));
-    // Compare.
-    test_function.line(String::from(r#"assert_eq!(parsed, reparsed);"#));
 
     let mut test_module = codegen::Module::new("test");
     test_module.annotation(vec!["cfg(test)"]);
     test_module.import("super", "*");
     test_module.scope().raw("extern crate serde_json;");
-    test_module.scope().push_fn(test_function);
+
+    for (i, relative) in relatives.iter().enumerate() {
+        let name = match i {
+            // For backwards compatability.
+            0 => "example_event".into(),
+            _ => format!("example_event_{}", i),
+        };
+        let mut test_function = codegen::Function::new(&name);
+        test_function.annotation(vec!["test"]);
+        // Include the fixture content.
+        test_function.line(format!(
+            r#"let data = include_bytes!("{}");"#,
+            relative.to_string_lossy(),
+        ));
+        // Deserialize.
+        test_function.line(format!(
+            r#"let parsed: {} = serde_json::from_slice(data).unwrap();"#,
+            toplevel_type.expect("top-level type defined"),
+        ));
+        // Serialize.
+        test_function.line(String::from(
+            r#"let output: String = serde_json::to_string(&parsed).unwrap();"#,
+        ));
+        // Deserialize.
+        test_function.line(format!(
+            r#"let reparsed: {} = serde_json::from_slice(output.as_bytes()).unwrap();"#,
+            toplevel_type.expect("top-level type defined"),
+        ));
+        // Compare.
+        test_function.line(String::from(r#"assert_eq!(parsed, reparsed);"#));
+        test_module.scope().push_fn(test_function);
+    }
+
     Ok(test_module)
 }
 
@@ -259,16 +316,16 @@ main!(|args: Cli, log_level: verbosity| {
             debug!("Go ------v\n{}", go);
             debug!("Rust-----v\n{}", rust);
 
-            // Check for an example event in their test data.
-            let example_event =
-                find_example_event(&fuzzy_example_events, &file_name, &example_event_path)?;
+            // Check for an example events in their test data.
+            let example_events =
+                find_example_events(&fuzzy_example_events, &file_name, &example_event_path)?;
 
             parsed_files.push(ParsedEventFile {
                 service_name: file_name.into_owned(),
                 path,
                 go,
                 rust,
-                example_event,
+                example_events,
             });
         }
     }
@@ -290,12 +347,12 @@ main!(|args: Cli, log_level: verbosity| {
                 .expect("a file name exists"),
         );
 
-        if let Some(ref example_event) = parsed.example_event {
-            // Write the example event to a test fixture.
-            trace!("Writing fixure for: {:?}", parsed.service_name);
-            let relative = write_fixture(
+        if !parsed.example_events.is_empty() {
+            // Write the example events to a test fixture.
+            trace!("Writing fixures for: {:?}", parsed.service_name);
+            let relatives = write_fixtures(
                 &parsed.service_name,
-                &example_event,
+                &parsed.example_events,
                 &out_dir,
                 &args.overwrite,
             )?;
@@ -303,7 +360,7 @@ main!(|args: Cli, log_level: verbosity| {
             // Generate a test module with a test that deserializes the example
             // event.
             trace!("Generating test module for: {:?}", parsed.service_name);
-            let test_module = generate_test_module(&parsed.rust.scope(), &relative)?;
+            let test_module = generate_test_module(&parsed.rust.scope(), &relatives)?;
             parsed.rust.push_module(test_module);
         }
 

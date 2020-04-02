@@ -5,6 +5,7 @@ authors = ["Christian Legnitto <christian@legnitto.com>"]
 publish = false
 
 [dependencies]
+regex = "1"
 quicli = "0.2"
 glob = "0.2"
 go_to_rust = { path = "./go_to_rust" }
